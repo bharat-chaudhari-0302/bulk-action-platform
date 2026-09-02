@@ -107,34 +107,35 @@ async def plan_bulk_action(ctx: dict[str, Any], action_id: str) -> dict[str, Any
             )
 
     try:
-        async with session_scope() as session:
-            async for planned in plan_batches(
-                session,
-                entity,
-                action.account_id,
-                batch_size=action.batch_size,
-                filters=handler.selection_filters(config),
-                entity_ids=handler.explicit_ids(config),
-                include_deleted=handler.include_deleted,
-            ):
-                pending.append(
-                    {
-                        "id": uuid.uuid4(),
-                        "bulk_action_id": aid,
-                        "batch_index": planned.index,
-                        "status": BatchStatus.PENDING.value,
-                        "entity_ids": planned.entity_ids,
-                        "cursor_start": planned.cursor_start,
-                        "cursor_end": planned.cursor_end,
-                        "entity_count": planned.entity_count,
-                    }
-                )
-                total_entities += planned.entity_count
-                total_batches += 1
+        # No enclosing transaction: the planner opens a short one per page, so a
+        # million-row walk never pins a snapshot or holds a connection.
+        async for planned in plan_batches(
+            session_scope,
+            entity,
+            action.account_id,
+            batch_size=action.batch_size,
+            filters=handler.selection_filters(config),
+            entity_ids=handler.explicit_ids(config),
+            include_deleted=handler.include_deleted,
+        ):
+            pending.append(
+                {
+                    "id": uuid.uuid4(),
+                    "bulk_action_id": aid,
+                    "batch_index": planned.index,
+                    "status": BatchStatus.PENDING.value,
+                    "entity_ids": planned.entity_ids,
+                    "cursor_start": planned.cursor_start,
+                    "cursor_end": planned.cursor_end,
+                    "entity_count": planned.entity_count,
+                }
+            )
+            total_entities += planned.entity_count
+            total_batches += 1
 
-                if len(pending) >= _PLAN_FLUSH_EVERY:
-                    await flush(pending)
-                    pending = []
+            if len(pending) >= _PLAN_FLUSH_EVERY:
+                await flush(pending)
+                pending = []
 
         await flush(pending)
     except Exception as exc:

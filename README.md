@@ -501,6 +501,19 @@ Two limits are enforced: **processing** (entities/minute, per account, configura
 account via `accounts.rate_limit_per_minute`) and **submission** (bulk actions/minute,
 guarding the write path, `429` with a `Retry-After` header).
 
+*Burst behaviour, explicitly:* the bucket's capacity equals the per-minute limit, so a
+fully-refilled account can spend its whole minute's budget at once and is then throttled to
+the refill rate. That is the correct reading of "no account exceeds 10 000 events per
+minute", and it lets a normal-sized action start instantly instead of being drip-fed. If a
+deployment wants a smoother profile, capacity and refill rate are separate arguments to the
+bucket -- setting capacity to a fraction of the limit caps the burst without changing the
+sustained rate.
+
+*What is deliberately **not** limited:* how many actions an account may have queued at once.
+The limiter throttles *processing*, not *accumulation*, so a client can still pile up work
+that will take hours to drain. A cap on concurrently active actions per account, returning
+`429`, is the natural next control and is listed under scaling below.
+
 ### De-duplication — skip duplicate entities by email
 
 Set `"deduplicate_by": "email"`. The first entity for each email is processed; every later
@@ -559,6 +572,20 @@ built to be safely re-runnable.
 | Entity deleted between planning and execution | `RETURNING` reveals it; logged as `entity_not_found` / `left_target_set`, so `processed_count` can still reach `total_entities` and progress never stalls at 99% |
 | Client retries a submission after a timeout | `idempotency_key` returns the original action and enqueues nothing |
 | Cross-tenant id in `entity_ids` | Row loads are tenant-scoped, so it returns no row and is reported as not-found. It can never be read or written |
+
+### Availability and resource behaviour
+
+| Concern | How it is handled |
+|---|---|
+| Dependency restart | `restart: unless-stopped` on every service; a Redis blip no longer permanently kills a worker |
+| Startup ordering | Workers wait on the API's healthcheck, because the API runs the migrations |
+| Graceful shutdown | `stop_grace_period: 60s`, so arq drains an in-flight batch instead of having it killed mid-transaction and redelivered |
+| Liveness vs readiness | `/healthz` touches no dependency, so a database blip cannot get a healthy pod killed; `/readyz` checks Postgres and Redis and returns 503 |
+| Transient database errors | arq retries with exponential backoff; the batch transaction rolled back, so the retry is clean |
+| Poison batch | After `JOB_MAX_TRIES` it is marked `failed` and its entities logged, and the action still finalises |
+| Long-running scans | Planning uses one short transaction per page, so no snapshot is pinned and no pooled connection is held for the length of a million-row walk |
+| Unbounded memory | Peak planner memory is one page of ids; batch memory is one `batch_size` slice; log writes are one statement per batch. Nothing accumulates across batches |
+| Connection pool | `db_pool_size` 20 + 10 overflow per process. With N workers plan for `N x 30 + api` against Postgres `max_connections`; beyond a handful of replicas put PgBouncer in transaction mode in front (the engine already sets `statement_cache_size=0` for exactly this) |
 
 **Cancellation semantics.** Batches that have already committed keep their work. A bulk
 action is not a transaction, and pretending otherwise would mean holding a lock over a

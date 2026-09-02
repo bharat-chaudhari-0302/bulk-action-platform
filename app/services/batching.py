@@ -16,7 +16,8 @@ target set in the meantime are reported rather than silently miscounted.
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 
 from sqlalchemy import select
@@ -28,6 +29,9 @@ from app.domain.entities.base import EntityDescriptor
 from app.domain.filters import selection_clause
 
 log = get_logger(__name__)
+
+#: Something that yields a fresh transactional session, e.g. `db.session_scope`.
+SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 
 @dataclass(slots=True)
@@ -52,7 +56,7 @@ def effective_batch_size(requested: int | None, rate_limit_per_minute: int) -> i
 
 
 async def plan_batches(
-    session: AsyncSession,
+    session_factory: SessionFactory,
     entity: type[EntityDescriptor],
     account_id: uuid.UUID,
     *,
@@ -61,27 +65,44 @@ async def plan_batches(
     entity_ids: list[uuid.UUID] | None = None,
     include_deleted: bool = False,
 ) -> AsyncIterator[PlannedBatch]:
-    """Yield batches covering the target set, in id order."""
+    """Yield batches covering the target set, in id order.
+
+    Takes a *session factory* rather than a session, because planning a large
+    target set is a long walk and each page must be its own short transaction.
+    See `_plan_from_filter`.
+    """
     if entity_ids is not None:
-        async for batch in _plan_from_ids(
-            session, entity, account_id, entity_ids, batch_size, include_deleted
-        ):
+        async for batch in _plan_from_ids(entity_ids, batch_size):
             yield batch
     else:
         async for batch in _plan_from_filter(
-            session, entity, account_id, filters, batch_size, include_deleted
+            session_factory, entity, account_id, filters, batch_size, include_deleted
         ):
             yield batch
 
 
 async def _plan_from_filter(
-    session: AsyncSession,
+    session_factory: SessionFactory,
     entity: type[EntityDescriptor],
     account_id: uuid.UUID,
     filters: dict | None,
     batch_size: int,
     include_deleted: bool,
 ) -> AsyncIterator[PlannedBatch]:
+    """Walk the target set by keyset, one short transaction per page.
+
+    Scanning a million rows inside a single transaction would hold one snapshot
+    open for the whole walk: it pins the oldest xmin so autovacuum cannot
+    reclaim dead tuples on the busiest tables, and it occupies a pooled
+    connection for minutes. Neither is acceptable for an operation whose whole
+    point is to be long-running.
+
+    A per-page transaction is safe here precisely because the plan is not a
+    snapshot of *rows*: batches record an id range, and the live filter is
+    re-applied when the batch executes. Entities that appear or disappear
+    mid-walk are handled by the same drift accounting that already covers the
+    gap between planning and execution.
+    """
     where = selection_clause(entity, account_id, filters, include_deleted)
     pk = entity.pk()
     last_id: uuid.UUID | None = None
@@ -92,7 +113,9 @@ async def _plan_from_filter(
         if last_id is not None:
             stmt = stmt.where(pk > last_id)
 
-        ids = [row[0] for row in (await session.execute(stmt)).all()]
+        async with session_factory() as session:
+            ids = [row[0] for row in (await session.execute(stmt)).all()]
+
         if not ids:
             return
 
@@ -110,12 +133,7 @@ async def _plan_from_filter(
 
 
 async def _plan_from_ids(
-    session: AsyncSession,
-    entity: type[EntityDescriptor],
-    account_id: uuid.UUID,
-    entity_ids: list[uuid.UUID],
-    batch_size: int,
-    include_deleted: bool,
+    entity_ids: list[uuid.UUID], batch_size: int
 ) -> AsyncIterator[PlannedBatch]:
     """Explicit id selection.
 

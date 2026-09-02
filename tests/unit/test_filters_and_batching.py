@@ -93,7 +93,7 @@ async def _collect(agen):
 @pytest.mark.asyncio
 async def test_explicit_ids_are_chunked_and_deduplicated():
     ids = [uuid.uuid4() for _ in range(5)]
-    batches = await _collect(_plan_from_ids(None, None, None, ids + ids, 2, False))
+    batches = await _collect(_plan_from_ids(ids + ids, 2))
     assert [b.entity_count for b in batches] == [2, 2, 1]
     assert sum(b.entity_count for b in batches) == 5  # duplicates dropped
 
@@ -101,7 +101,7 @@ async def test_explicit_ids_are_chunked_and_deduplicated():
 @pytest.mark.asyncio
 async def test_explicit_id_batches_carry_their_ids_and_are_ordered():
     ids = [uuid.uuid4() for _ in range(4)]
-    batches = await _collect(_plan_from_ids(None, None, None, ids, 10, False))
+    batches = await _collect(_plan_from_ids(ids, 10))
     assert batches[0].entity_ids == sorted(ids)
     assert batches[0].cursor_start == sorted(ids)[0]
 
