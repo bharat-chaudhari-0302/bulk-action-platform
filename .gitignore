@@ -17,3 +17,6 @@ loadtest-results.json
 
 # The assignment brief itself is not mine to publish
 *.pdf
+
+# Local notes and scratch
+notes/
