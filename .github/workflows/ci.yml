@@ -28,6 +28,9 @@ jobs:
           --health-cmd "redis-cli ping"
           --health-interval 5s --health-timeout 5s --health-retries 10
 
+    # Service containers get the standard ports here; docker-compose.yml uses
+    # 5433/6380 on a developer machine only to dodge a locally installed
+    # PostgreSQL or Redis.
     env:
       TEST_DATABASE_URL: postgresql+asyncpg://bulk:bulk@localhost:5432/bulk_actions_test
       TEST_REDIS_URL: redis://localhost:6379/15
@@ -49,7 +52,7 @@ jobs:
         run: ruff check app tests scripts
 
       - name: Type check
-        run: mypy app || true   # advisory: types are checked but do not gate the build
+        run: mypy app
 
       - name: Verify migrations apply cleanly
         run: alembic upgrade head

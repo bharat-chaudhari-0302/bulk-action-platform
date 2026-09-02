@@ -5,9 +5,10 @@ platform is concerned. Compare with company.py: the two differ only in their
 declarations, and every action works against both.
 """
 
-from typing import Annotated
+from typing import Annotated, cast
 
 from pydantic import Field
+from sqlalchemy import Table
 
 from app.domain.entities.base import EntityDescriptor, FieldSpec
 from app.domain.entities.registry import register_entity
@@ -18,7 +19,7 @@ from app.models.crm import Contact
 class ContactEntity(EntityDescriptor):
     name = "contact"
     label = "Contacts"
-    table = Contact.__table__
+    table = cast(Table, Contact.__table__)
 
     updatable_fields = {
         "name": FieldSpec(

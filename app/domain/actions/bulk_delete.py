@@ -9,10 +9,10 @@ migration -- only this module and its `@register_action` decorator.
 from __future__ import annotations
 
 import uuid
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlalchemy import delete, func, update
+from sqlalchemy import Executable, delete, func, update
 
 from app.core.errors import ValidationError
 from app.domain.actions.base import (
@@ -68,7 +68,7 @@ class BulkDeleteAction(BulkActionHandler):
     description: ClassVar[str] = (
         "Soft-delete (or, with `hard: true`, permanently remove) every entity in the target set."
     )
-    supported_entities: ClassVar[str] = "*"
+    supported_entities: ClassVar[frozenset[str] | Literal["*"]] = "*"
     ConfigModel: ClassVar[type[BaseModel]] = BulkDeleteConfig
 
     def validate_config(
@@ -98,15 +98,16 @@ class BulkDeleteAction(BulkActionHandler):
         entity = ctx.entity
         ids = [row.id for row in rows]
 
-        if config.hard:
-            stmt = (
+        soft_delete_column = entity.soft_delete_column
+        if config.hard or soft_delete_column is None:
+            stmt: Executable = (
                 delete(entity.table)
                 .where(pk_in(entity.pk(), ids))
                 .where(entity.account_col() == ctx.account_id)
                 .returning(entity.pk())
             )
         else:
-            values: dict[str, Any] = {entity.soft_delete_column: func.now()}
+            values: dict[str, Any] = {soft_delete_column: func.now()}
             if "updated_at" in entity.table.c:
                 values["updated_at"] = func.now()
             stmt = (

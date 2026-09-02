@@ -8,7 +8,7 @@ Those belong to the platform and are shared by every action.
 from __future__ import annotations
 
 import uuid
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import func, update
@@ -69,7 +69,7 @@ class BulkUpdateAction(BulkActionHandler):
     description: ClassVar[str] = (
         "Set one or more fields to the same value across every entity in the target set."
     )
-    supported_entities: ClassVar[str] = "*"
+    supported_entities: ClassVar[frozenset[str] | Literal["*"]] = "*"
     ConfigModel: ClassVar[type[BaseModel]] = BulkUpdateConfig
 
     def validate_config(

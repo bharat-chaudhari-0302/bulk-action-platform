@@ -273,6 +273,9 @@ async def process_batch(
     try:
         async with session_scope() as session:
             action = await _load_action(session, aid)
+            if action is None:
+                # Deleted between the pre-flight check and here.
+                return {"status": "missing"}
             batch = (
                 await session.execute(
                     select(BulkActionBatch).where(BulkActionBatch.id == batch_id)

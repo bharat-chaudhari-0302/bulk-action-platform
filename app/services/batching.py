@@ -129,8 +129,7 @@ async def _plan_from_ids(
     `entity_not_found` -- it can never be read or written across tenants.
     """
     # De-duplicate while preserving order, then sort so batches stay id-ordered.
-    seen: set[uuid.UUID] = set()
-    ordered = [i for i in entity_ids if not (i in seen or seen.add(i))]
+    ordered = list(dict.fromkeys(entity_ids))
 
     for index, start in enumerate(range(0, len(ordered), batch_size)):
         chunk = sorted(ordered[start : start + batch_size])

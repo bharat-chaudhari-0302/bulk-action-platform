@@ -19,7 +19,9 @@ a Lua script inside Redis: one round trip, no read-modify-write race.
 from __future__ import annotations
 
 import time
+from collections.abc import Awaitable
 from dataclasses import dataclass
+from typing import Any, cast
 
 from redis.asyncio import Redis
 
@@ -104,9 +106,14 @@ class RateLimiter:
                 f"Cannot consume {amount} tokens from a bucket of {limit_per_minute}."
             )
         refill_per_second = limit_per_minute / 60.0
-        allowed, retry_after, remaining = await self._script(
-            keys=[self._key(scope, identity)],
-            args=[limit_per_minute, refill_per_second, int(time.time() * 1000), amount],
+        # redis-py types Script.__call__ as sync-or-awaitable; on an async
+        # client it is always a coroutine.
+        allowed, retry_after, remaining = await cast(
+            Awaitable[list[Any]],
+            self._script(
+                keys=[self._key(scope, identity)],
+                args=[limit_per_minute, refill_per_second, int(time.time() * 1000), amount],
+            ),
         )
         return RateLimitDecision(
             allowed=bool(int(allowed)),
@@ -133,7 +140,10 @@ class RateLimiter:
 
     async def peek(self, scope: str, identity: str, *, limit_per_minute: int) -> float:
         """Tokens currently available, without consuming any."""
-        tokens, ts = await self._redis.hmget(self._key(scope, identity), ["tokens", "ts"])
+        tokens, ts = await cast(
+            Awaitable[list[Any]],
+            self._redis.hmget(self._key(scope, identity), ["tokens", "ts"]),
+        )
         if tokens is None or ts is None:
             return float(limit_per_minute)
         elapsed_s = max(0.0, time.time() * 1000 - float(ts)) / 1000.0

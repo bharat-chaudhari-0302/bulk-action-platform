@@ -5,9 +5,10 @@ table, and nothing else. Every registered action -- update, delete, and any
 future one -- works against it immediately.
 """
 
-from typing import Annotated
+from typing import Annotated, cast
 
 from pydantic import Field
+from sqlalchemy import Table
 
 from app.domain.entities.base import EntityDescriptor, FieldSpec
 from app.domain.entities.registry import register_entity
@@ -18,7 +19,7 @@ from app.models.crm import Company
 class CompanyEntity(EntityDescriptor):
     name = "company"
     label = "Companies"
-    table = Company.__table__
+    table = cast(Table, Company.__table__)
 
     updatable_fields = {
         "name": FieldSpec(
