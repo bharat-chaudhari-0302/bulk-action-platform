@@ -1,0 +1,84 @@
+name: bulk-action-platform
+
+services:
+  postgres:
+    restart: unless-stopped
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bulk
+      POSTGRES_PASSWORD: bulk
+      POSTGRES_DB: bulk_actions
+    ports:
+      # Host port 5433, not 5432: a locally installed PostgreSQL is common and
+      # silently wins the binding on Windows. Container-internal port is unchanged.
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bulk -d bulk_actions"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    # Tuned for bulk write throughput on a dev box.
+    command: >
+      postgres -c max_connections=200
+               -c shared_buffers=256MB
+               -c synchronous_commit=off
+
+  redis:
+    restart: unless-stopped
+    image: redis:7-alpine
+    ports:
+      # Host port 6380 for the same reason.
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    restart: unless-stopped
+    build: .
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://bulk:bulk@postgres:5432/bulk_actions
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./app:/srv/app
+      - ./alembic:/srv/alembic
+      - ./scripts:/srv/scripts
+
+  worker:
+    restart: unless-stopped
+    build: .
+    command: arq app.workers.worker.WorkerSettings
+    environment:
+      DATABASE_URL: postgresql+asyncpg://bulk:bulk@postgres:5432/bulk_actions
+      REDIS_URL: redis://redis:6379/0
+      WORKER_CONCURRENCY: 20
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+    volumes:
+      - ./app:/srv/app
+      - ./scripts:/srv/scripts
+    # Horizontal scaling: docker compose up -d --scale worker=4
+    deploy:
+      replicas: 2
+
+volumes:
+  pgdata:

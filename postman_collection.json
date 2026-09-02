@@ -1,0 +1,659 @@
+{
+  "info": {
+    "name": "Bulk Action Platform",
+    "description": "Complete API surface for the Shipmnts bulk action platform.\n\n## How to use\n\nThe requests are ordered so that running the collection top to bottom works with no manual editing: each request saves the ids it creates (`accountId`, `actionId`) into collection variables that later requests read.\n\n1. Start the stack: `docker compose up -d`\n2. Set `baseUrl` if you are not on `http://localhost:8000`\n3. Run the folders in order, or use Postman's Collection Runner\n\n## Folders\n\n- **Health** - liveness and readiness\n- **Setup** - create a tenant and generate demo data\n- **Discovery** - the live entity x action registry\n- **Bulk Actions** - the four required endpoints plus logs, batches, cancel and SSE\n- **Optional Enhancements** - de-duplication, scheduling, rate limiting\n- **Extensibility** - the same endpoints driving a second action and a second entity\n- **Error Handling** - what a bad request looks like",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:8000", "type": "string" },
+    { "key": "accountId", "value": "", "type": "string" },
+    { "key": "actionId", "value": "", "type": "string" },
+    { "key": "scheduledActionId", "value": "", "type": "string" },
+    { "key": "cancelActionId", "value": "", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Liveness",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/healthz", "host": ["{{baseUrl}}"], "path": ["healthz"] },
+            "description": "Process is up. Touches no dependency on purpose, so a database blip does not get the pod killed."
+          }
+        },
+        {
+          "name": "Readiness",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/readyz", "host": ["{{baseUrl}}"], "path": ["readyz"] },
+            "description": "Checks Postgres and Redis. Returns 503 when a dependency is unreachable."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Setup",
+      "item": [
+        {
+          "name": "Create account",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('201 Created', () => pm.response.to.have.status(201));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('accountId', body.id);",
+                  "console.log('accountId =', body.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Acme Logistics\",\n  \"rate_limit_per_minute\": 10000\n}"
+            },
+            "url": { "raw": "{{baseUrl}}/accounts", "host": ["{{baseUrl}}"], "path": ["accounts"] },
+            "description": "A tenant. `rate_limit_per_minute` is the processing ceiling in entities/minute; 10000 is the figure the assignment specifies."
+          }
+        },
+        {
+          "name": "List accounts",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/accounts", "host": ["{{baseUrl}}"], "path": ["accounts"] }
+          }
+        },
+        {
+          "name": "Seed contacts (with duplicates)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"count\": 5000,\n  \"duplicate_ratio\": 0.2\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/entities/contact/seed",
+              "host": ["{{baseUrl}}"],
+              "path": ["entities", "contact", "seed"]
+            },
+            "description": "Generates demo contacts. `duplicate_ratio: 0.2` makes 20% of rows reuse an earlier email so de-duplication has something to find.\n\nFor large volumes use the CLI instead, which writes with COPY:\n`python scripts/seed.py --count 200000 --duplicate-ratio 0.2`"
+          }
+        },
+        {
+          "name": "Seed companies",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"count\": 2000,\n  \"duplicate_ratio\": 0.1\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/entities/company/seed",
+              "host": ["{{baseUrl}}"],
+              "path": ["entities", "company", "seed"]
+            },
+            "description": "The same endpoint, a different entity. Nothing entity-specific was written to make this work."
+          }
+        },
+        {
+          "name": "List contacts",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/entities/contact?account_id={{accountId}}&limit=10",
+              "host": ["{{baseUrl}}"],
+              "path": ["entities", "contact"],
+              "query": [
+                { "key": "account_id", "value": "{{accountId}}" },
+                { "key": "limit", "value": "10" },
+                { "key": "status", "value": "active", "disabled": true },
+                { "key": "include_deleted", "value": "true", "disabled": true }
+              ]
+            },
+            "description": "Used to verify that a bulk action really changed the rows it claims to have changed."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Discovery",
+      "item": [
+        {
+          "name": "Registry (entities x actions)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions/registry",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions", "registry"]
+            },
+            "description": "Rendered from the live registries, not from hand-maintained docs. Returns every entity with its updatable fields and de-duplication keys, every action with its JSON Schema, and the full list of working entity x action combinations.\n\nDrop a new module into `app/domain/actions/` and it appears here on the next boot."
+          }
+        },
+        {
+          "name": "Entity types",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/entities", "host": ["{{baseUrl}}"], "path": ["entities"] }
+          }
+        },
+        {
+          "name": "OpenAPI docs",
+          "request": {
+            "method": "GET",
+            "url": { "raw": "{{baseUrl}}/docs", "host": ["{{baseUrl}}"], "path": ["docs"] }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Bulk Actions",
+      "item": [
+        {
+          "name": "Create - bulk update by filter",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('202 Accepted', () => pm.response.to.have.status(202));",
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('actionId', body.id);",
+                  "pm.test('starts queued', () => pm.expect(body.status).to.eql('queued'));",
+                  "console.log('actionId =', body.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"contact\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": {\n      \"status\": \"churned\",\n      \"age\": 41\n    },\n    \"filter\": {\n      \"status\": \"active\"\n    }\n  },\n  \"batch_size\": 1000\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            },
+            "description": "**POST /bulk-actions** - the creation endpoint.\n\nReturns 202 with an id; the work happens on the queue. Everything is validated before anything is enqueued: the entity, the action, their compatibility, the payload schema, every update value against the entity's declared types, and the filter's fields and operators.\n\n`filter` selects the target set. `{}` means every entity in the account. Operators: `eq` (shorthand), `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `contains`, `is_null` -- e.g. `{\"age\": {\"gte\": 30}, \"email\": {\"contains\": \"@acme\"}}`."
+          }
+        },
+        {
+          "name": "Create - bulk update by explicit ids",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"contact\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": {\n      \"name\": \"Renamed by bulk action\"\n    },\n    \"entity_ids\": [\n      \"REPLACE-WITH-A-REAL-CONTACT-ID\"\n    ]\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            },
+            "description": "`entity_ids` freezes the target set at submission time, instead of resolving a filter later. Paste ids from **Setup > List contacts**."
+          }
+        },
+        {
+          "name": "Create - with idempotency key",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"contact\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": { \"status\": \"reviewed\" },\n    \"filter\": {}\n  },\n  \"idempotency_key\": \"nightly-sync-2026-09-02\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            },
+            "description": "Send this twice. The first call returns **202** with a new id; the second returns **200** with the *same* id and enqueues nothing, so a client that retries through a network failure cannot double-apply a million-row update."
+          }
+        },
+        {
+          "name": "List bulk actions",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions?account_id={{accountId}}&limit=20",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"],
+              "query": [
+                { "key": "account_id", "value": "{{accountId}}" },
+                { "key": "limit", "value": "20" },
+                { "key": "offset", "value": "0", "disabled": true },
+                { "key": "status", "value": "processing", "disabled": true },
+                { "key": "entity_type", "value": "contact", "disabled": true },
+                { "key": "action_type", "value": "update", "disabled": true }
+              ]
+            },
+            "description": "**GET /bulk-actions** - the list endpoint.\n\nEnable the `status` query parameter for the ongoing / completed / queued views the assignment's UI section asks for: `scheduled`, `queued`, `planning`, `processing`, `completed`, `completed_with_errors`, `failed`, `cancelled`."
+          }
+        },
+        {
+          "name": "Get bulk action (progress)",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions/{{actionId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions", "{{actionId}}"]
+            },
+            "description": "**GET /bulk-actions/{actionId}** - the status endpoint.\n\nIncludes `progress_percent`, `completed_batches`/`total_batches` and the live counters. Poll this, or use the SSE stream below."
+          }
+        },
+        {
+          "name": "Get stats",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions/{{actionId}}/stats",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions", "{{actionId}}", "stats"]
+            },
+            "description": "**GET /bulk-actions/{actionId}/stats** - the summary endpoint.\n\nSuccess, failure and skipped counts, plus observed throughput and a breakdown of failures and skips by reason code so a UI can group them without parsing prose.\n\nThe headline counters are a single-row read: they are maintained on the action row as batches commit, not aggregated over the log table."
+          }
+        },
+        {
+          "name": "Get logs - all",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions/{{actionId}}/logs?limit=50",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions", "{{actionId}}", "logs"],
+              "query": [
+                { "key": "limit", "value": "50" },
+                { "key": "cursor", "value": "", "disabled": true }
+              ]
+            },
+            "description": "One row per processed entity. Keyset paginated: pass the response's `next_cursor` back as `cursor`, which stays an index seek even a million rows deep."
+          }
+        },
+        {
+          "name": "Get logs - failures only",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions/{{actionId}}/logs?status=failed&limit=50",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions", "{{actionId}}", "logs"],
+              "query": [
+                { "key": "status", "value": "failed" },
+                { "key": "limit", "value": "50" }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Get logs - skipped only",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions/{{actionId}}/logs?status=skipped&limit=50",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions", "{{actionId}}", "logs"],
+              "query": [
+                { "key": "status", "value": "skipped" },
+                { "key": "limit", "value": "50" },
+                { "key": "reason_code", "value": "duplicate_email", "disabled": true },
+                { "key": "entity_id", "value": "", "disabled": true }
+              ]
+            },
+            "description": "Enable `reason_code=duplicate_email` to see exactly the entities the de-duplicator skipped. `entity_id` traces a single entity's outcome."
+          }
+        },
+        {
+          "name": "Get batches",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions/{{actionId}}/batches",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions", "{{actionId}}", "batches"]
+            },
+            "description": "Batch-level view: status, per-batch counts and `attempts`, which is where a retried batch shows up."
+          }
+        },
+        {
+          "name": "Stream progress (SSE)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "Accept", "value": "text/event-stream" }],
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions/{{actionId}}/events",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions", "{{actionId}}", "events"]
+            },
+            "description": "Real-time progress. Workers publish a frame after each batch commits.\n\nPostman renders SSE poorly; `curl -N {{baseUrl}}/bulk-actions/{{actionId}}/events` shows it properly.\n\nThe current state is sent immediately, so a client that connects late is not left staring at an empty stream."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Optional Enhancements",
+      "item": [
+        {
+          "name": "De-duplication - skip duplicate emails",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('actionId', body.id);"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"contact\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": { \"status\": \"deduplicated\" },\n    \"filter\": {},\n    \"deduplicate_by\": \"email\"\n  },\n  \"batch_size\": 1000\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            },
+            "description": "Seed with `duplicate_ratio: 0.2` first, then run this and check **Get logs - skipped only** with `reason_code=duplicate_email`.\n\nThe first entity for each email is processed and every later one is logged as `skipped`. Uniqueness is arbitrated by a Postgres primary key, not an in-process set, so it stays correct across concurrent workers and across job retries."
+          }
+        },
+        {
+          "name": "Scheduling - start in the future",
+          "event": [
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set('futureTime', new Date(Date.now() + 2*60*1000).toISOString());"
+                ]
+              }
+            },
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const body = pm.response.json();",
+                  "pm.collectionVariables.set('scheduledActionId', body.id);",
+                  "pm.test('status is scheduled', () => pm.expect(body.status).to.eql('scheduled'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"contact\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": { \"status\": \"scheduled-run\" },\n    \"filter\": {}\n  },\n  \"scheduled_at\": \"{{futureTime}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            },
+            "description": "The pre-request script sets `scheduled_at` two minutes ahead.\n\nThe action is stored as `scheduled` and the job is enqueued with arq's `_defer_until`, so the queue itself holds the delay -- there is no cron or beat process to run or to fail."
+          }
+        },
+        {
+          "name": "Scheduling - cancel before it starts",
+          "request": {
+            "method": "POST",
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions/{{scheduledActionId}}/cancel",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions", "{{scheduledActionId}}", "cancel"]
+            },
+            "description": "Cancellation works while an action is scheduled, queued, or already running: workers check the status before each batch, so in-flight work stops at the next batch boundary. Batches that already committed keep their work -- a bulk action is not a transaction."
+          }
+        },
+        {
+          "name": "Rate limiting - lower the account limit",
+          "request": {
+            "method": "PATCH",
+            "url": {
+              "raw": "{{baseUrl}}/accounts/{{accountId}}?rate_limit_per_minute=600",
+              "host": ["{{baseUrl}}"],
+              "path": ["accounts", "{{accountId}}"],
+              "query": [{ "key": "rate_limit_per_minute", "value": "600" }]
+            },
+            "description": "Drop the ceiling to 600 entities/minute, then submit a large action and watch `processed_count` advance at that rate instead of full speed.\n\nThe limit is a Redis token bucket consumed at entity granularity by the worker, so it caps real throughput rather than request count. A batch that cannot be admitted is re-scheduled for when the bucket refills; nothing is dropped.\n\nSet it back to 10000 afterwards."
+          }
+        },
+        {
+          "name": "Rate limiting - restore the account limit",
+          "request": {
+            "method": "PATCH",
+            "url": {
+              "raw": "{{baseUrl}}/accounts/{{accountId}}?rate_limit_per_minute=10000",
+              "host": ["{{baseUrl}}"],
+              "path": ["accounts", "{{accountId}}"],
+              "query": [{ "key": "rate_limit_per_minute", "value": "10000" }]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Extensibility",
+      "item": [
+        {
+          "name": "Bulk delete - contacts (soft)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"contact\",\n  \"action_type\": \"delete\",\n  \"payload\": {\n    \"filter\": { \"status\": \"churned\" }\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            },
+            "description": "A second action, added to a finished platform. It required one file and a decorator: no change to the API layer, the planner, the batch worker, the rate limiter, the de-duplicator, the logging pipeline, or any migration.\n\nSoft delete by default, so it is reversible; pass `\"hard\": true` to remove rows permanently."
+          }
+        },
+        {
+          "name": "Bulk update - companies",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"company\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": {\n      \"industry\": \"logistics\",\n      \"status\": \"prospect\"\n    },\n    \"filter\": {}\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            },
+            "description": "A second entity, through exactly the same endpoint and the same action implementation."
+          }
+        },
+        {
+          "name": "Bulk update - companies, dedupe by domain",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"company\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": { \"status\": \"reviewed\" },\n    \"filter\": {},\n    \"deduplicate_by\": \"domain\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            },
+            "description": "De-duplication is a declared property of the entity, not a hard-coded email special case: Company declares `domain` as its key and the identical pipeline uses it."
+          }
+        },
+        {
+          "name": "Bulk delete - companies (hard)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"company\",\n  \"action_type\": \"delete\",\n  \"payload\": {\n    \"filter\": { \"status\": \"churned\" },\n    \"hard\": true\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            },
+            "description": "Two entities x two actions, all four combinations from one core implementation."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Error Handling",
+      "item": [
+        {
+          "name": "422 - value outside the declared range",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('422', () => pm.response.to.have.status(422));",
+                  "pm.test('names the offending field', () => pm.expect(pm.response.text()).to.include('age'));"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"contact\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": { \"age\": 900 },\n    \"filter\": {}\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            },
+            "description": "Rejected at submission, before anything is enqueued. The alternative is discovering the same mistake a million times, an hour later."
+          }
+        },
+        {
+          "name": "422 - field the entity does not expose",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"contact\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": { \"salary\": 100000 },\n    \"filter\": {}\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            },
+            "description": "The error names the fields that *are* updatable, so the caller can self-correct."
+          }
+        },
+        {
+          "name": "422 - unknown entity type",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"unicorn\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": { \"status\": \"x\" },\n    \"filter\": {}\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            }
+          }
+        },
+        {
+          "name": "422 - no target set specified",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"contact\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": { \"status\": \"x\" }\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            },
+            "description": "Neither `filter` nor `entity_ids`. The platform refuses to guess, because the difference between \"no filter\" and \"match everything\" is a million rows. Pass `\"filter\": {}` to genuinely mean everything."
+          }
+        },
+        {
+          "name": "422 - scheduled in the past",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"{{accountId}}\",\n  \"entity_type\": \"contact\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": { \"status\": \"x\" },\n    \"filter\": {}\n  },\n  \"scheduled_at\": \"2020-01-01T00:00:00Z\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            }
+          }
+        },
+        {
+          "name": "404 - unknown account",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"account_id\": \"00000000-0000-4000-8000-000000000000\",\n  \"entity_type\": \"contact\",\n  \"action_type\": \"update\",\n  \"payload\": {\n    \"updates\": { \"status\": \"x\" },\n    \"filter\": {}\n  }\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions"]
+            }
+          }
+        },
+        {
+          "name": "404 - unknown bulk action",
+          "request": {
+            "method": "GET",
+            "url": {
+              "raw": "{{baseUrl}}/bulk-actions/00000000-0000-4000-8000-000000000000",
+              "host": ["{{baseUrl}}"],
+              "path": ["bulk-actions", "00000000-0000-4000-8000-000000000000"]
+            },
+            "description": "Errors are RFC 7807 problem+json: `type`, `title`, `status`, `code`, `detail`."
+          }
+        }
+      ]
+    }
+  ]
+}
