@@ -20,3 +20,7 @@ loadtest-results.json
 
 # Local notes and scratch
 notes/
+
+# Demo scratch (account / action ids)
+.acc
+.aid
